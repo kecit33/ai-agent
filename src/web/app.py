@@ -36,7 +36,15 @@ _LOG = get_logger("web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # 用户不点确认时最多等这么久，超时按拒绝处理（避免后台任务永久悬挂）
-CONFIRM_TIMEOUT_SEC = 120.0
+# 45 秒是一个"来得及读弹窗、又不会拖垮后续对话"的折中
+CONFIRM_TIMEOUT_SEC = 45.0
+
+# 后台任务的整体上限：controller 墙钟（默认 120s）+ 收尾/确认的余量
+TASK_WATCHDOG_SEC = 200.0
+
+# 同一会话的消息上下文必须串行读写（否则历史顺序会交错），
+# 但不同会话之间没有理由互相排队。锁按 session_id 粒度管理。
+LOCK_ACQUIRE_TIMEOUT_SEC = 3.0
 
 
 class ChatRequest(BaseModel):
@@ -54,7 +62,7 @@ class AppState:
         self.cfg: Config | None = None
         self.controller: AgentController | None = None
         self.memory: MemoryStore | None = None
-        self.run_lock = asyncio.Lock()
+        self.session_locks: dict[int, asyncio.Lock] = {}
         self.tasks: dict[str, dict[str, Any]] = {}
         self.pending_confirm: dict[str, asyncio.Event] = {}
         self.confirm_result: dict[str, bool] = {}
@@ -63,6 +71,13 @@ class AppState:
         # Key 只驻留内存，不落盘、不进日志。
         self.default_llm: Any = None
         self.user_llms: dict[str, Any] = {}
+
+    def lock_for(self, session_id: int) -> asyncio.Lock:
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        return lock
 
 
 STATE = AppState()
@@ -98,20 +113,62 @@ async def _confirm_cb_factory(task_id: str):
     return _cb
 
 
+def _busy_reply() -> dict[str, Any]:
+    """同一会话的上一个任务还没结束（典型：确认弹窗没人点）时的明确反馈。"""
+    return {
+        "text": "上一条指令还在等待你的确认（或正在执行中）。\n"
+                "如果看到确认弹窗，请先点「允许」或「拒绝」；"
+                "如果弹窗已被关掉，稍等片刻它会自动按拒绝处理，然后再发一次即可。",
+        "steps": 0,
+        "stop_reason": "busy",
+        "stop_reason_cn": "上一任务未完成",
+        "wall_ms": 0,
+        "prompt_tokens": 0,
+        "trace_id": "",
+        "degraded": False,
+        "tool_calls": [],
+    }
+
+
 def _spawn_run(task_id: str, message: str, session_id: int, api_key: str = "", model: str = "") -> None:
     async def _job() -> None:
         assert STATE.controller is not None
+        # 按请求选好模型实例，作为参数传入 run（不写回 controller.llm，
+        # 否则两个带不同 Key 的并发请求会互相覆盖对方正在用的模型）
+        llm = _get_user_llm(api_key, model) if api_key else STATE.default_llm
+        lock = STATE.lock_for(session_id)
+
+        # 拿锁带超时：同一会话的上一个任务还挂着时立刻给用户可操作的反馈，
+        # 而不是让前端无声转圈直到对方超时（这是"问待办卡死"的根因之一）。
         try:
-            async with STATE.run_lock:  # 同一时刻只跑一个任务，避免会话上下文交错
-                # 按请求切换模型：带 Key 用真实模型，不带则回到服务端默认（通常是 Mock）
-                if api_key:
-                    STATE.controller.llm = _get_user_llm(api_key, model)
-                else:
-                    STATE.controller.llm = STATE.default_llm
-                reply = await STATE.controller.run(message, session_id)
+            await asyncio.wait_for(lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            STATE.tasks[task_id] = {
+                "status": "done",
+                "result": _busy_reply(),
+                "session_id": session_id,
+            }
+            STATE.pending_confirm.pop(task_id, None)
+            return
+
+        try:
+            # 确认回调必须在拿到锁之后再挂到 controller 上：
+            # 提前挂会被仍在执行的上一个任务"借走"，出现 A 的确认弹到 B 头上的竞态。
+            STATE.controller.confirm_cb = await _confirm_cb_factory(task_id)
+            reply = await asyncio.wait_for(
+                STATE.controller.run(message, session_id, llm=llm),
+                timeout=TASK_WATCHDOG_SEC,  # 看门狗：任何意外挂起都不能让任务永远 running
+            )
             STATE.tasks[task_id] = {
                 "status": "done",
                 "result": reply_to_dict(reply),
+                "session_id": session_id,
+            }
+        except asyncio.TimeoutError:
+            _LOG.error("task %s watchdog timeout (>%.0fs)", task_id, TASK_WATCHDOG_SEC)
+            STATE.tasks[task_id] = {
+                "status": "error",
+                "error": f"任务超过 {TASK_WATCHDOG_SEC:.0f} 秒仍未完成，已被看门狗中止。请重试。",
                 "session_id": session_id,
             }
         except Exception as exc:
@@ -142,6 +199,7 @@ def _spawn_run(task_id: str, message: str, session_id: int, api_key: str = "", m
                 }
         finally:
             STATE.pending_confirm.pop(task_id, None)
+            lock.release()
 
     asyncio.create_task(_job())
 
@@ -220,8 +278,7 @@ async def api_chat(req: ChatRequest, request: Request) -> dict[str, Any]:
 
     task_id = uuid.uuid4().hex[:12]
     STATE.tasks[task_id] = {"status": "running", "session_id": session_id}
-    # 每个任务挂一个独立的确认回调，回调内部知道该唤醒哪个事件
-    STATE.controller.confirm_cb = await _confirm_cb_factory(task_id)
+    # 确认回调在 _spawn_run 拿到会话锁之后再挂载（避免被仍在执行的上一个任务借走）
     _spawn_run(task_id, req.message, session_id, api_key, model)
     return {"task_id": task_id, "session_id": session_id, "status": "running"}
 

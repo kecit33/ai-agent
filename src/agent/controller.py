@@ -116,7 +116,14 @@ class AgentController:
 
     # ---------------- 主循环 ----------------
 
-    async def run(self, user_text: str, session_id: int) -> AgentReply:
+    async def run(self, user_text: str, session_id: int, llm=None) -> AgentReply:
+        """执行一轮用户输入。
+
+        llm 参数：Web 端按请求传入（不同访问者可能带各自的 Key），
+        不传则用 self.llm。整个 run 内部只用这个局部变量——绝不能写回
+        self.llm，否则两个并发请求会互相覆盖对方正在用的模型。
+        """
+        llm = llm or self.llm
         self.trace_id = new_trace_id()
         started = time.monotonic()
         tokens_used = 0
@@ -141,17 +148,17 @@ class AgentController:
                 now=time.strftime("%Y-%m-%d %H:%M:%S"),
                 facts_block=self.memory.render_facts(),
             )
-            messages = await self.memory.build_context(session_id, system_prompt, llm=self.llm)
+            messages = await self.memory.build_context(session_id, system_prompt, llm=llm)
 
             try:
-                turn = await self._chat_with_fallback(messages)
+                turn = await self._chat_with_fallback(messages, llm)
             except LlmUnavailable as exc:
                 _LOG.error("LLM 不可用: %s", exc)
-                if not isinstance(self.llm, MockLlm):
-                    # 降级：切到规则模型，保证服务不中断（同时如实告知用户）
-                    self.llm = MockLlm(self.cfg)
+                if not isinstance(llm, MockLlm):
+                    # 降级：仅本次请求切到规则模型（局部变量），保证服务不中断（同时如实告知用户）
+                    llm = MockLlm(self.cfg)
                     degraded = True
-                    turn = await self.llm.chat(messages, tools=self.tools)
+                    turn = await llm.chat(messages, tools=self.tools)
                 else:
                     stop_reason = STOP_ERROR
                     final_text = f"模型不可用，且已无可用降级方案：{exc}"
@@ -220,7 +227,7 @@ class AgentController:
 
         # 非正常结束时必须给一句人话，不能把半截状态丢给用户
         if stop_reason != STOP_FINAL and not final_text:
-            final_text = await self._wrap_up(session_id, stop_reason)
+            final_text = await self._wrap_up(session_id, stop_reason, llm)
 
         wall_ms = int((time.monotonic() - started) * 1000)
         reply = AgentReply(
@@ -237,10 +244,11 @@ class AgentController:
                   self.trace_id, stop_reason, len(records), wall_ms)
         return reply
 
-    async def _chat_with_fallback(self, messages: list[dict[str, Any]]) -> AssistantTurn:
+    async def _chat_with_fallback(self, messages: list[dict[str, Any]], llm=None) -> AssistantTurn:
         """LLM 调用统一入口：网络类异常退避重试，其它异常直接抛。"""
+        llm = llm or self.llm
         return await retry_async(
-            lambda: self.llm.chat(messages, tools=self.tools),
+            lambda: llm.chat(messages, tools=self.tools),
             attempts=2,
             base=1.0,
             cap=4.0,
@@ -264,8 +272,9 @@ class AgentController:
             _LOG.error("确认回调异常，按拒绝处理: %s", exc)
             return False
 
-    async def _wrap_up(self, session_id: int, stop_reason: str) -> str:
+    async def _wrap_up(self, session_id: int, stop_reason: str, llm=None) -> str:
         """被预算/失败打断时，不带工具再问一次，让模型基于已有信息给出结论。"""
+        llm = llm or self.llm
         system_prompt = build_system_prompt(
             now=time.strftime("%Y-%m-%d %H:%M:%S"),
             facts_block=self.memory.render_facts(),
@@ -279,7 +288,7 @@ class AgentController:
             ),
         })
         try:
-            turn = await self.llm.chat(messages, tools=None)
+            turn = await llm.chat(messages, tools=None)
             return turn.content or f"（已停止：{STOP_REASON_CN.get(stop_reason, stop_reason)}）"
         except Exception as exc:
             _LOG.warning("收尾总结失败: %s", exc)
