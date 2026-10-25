@@ -1,0 +1,6 @@
+# 语音加分项（可选）：不安装也能正常运行主链路，仅在 --voice 模式需要
+# 安装：pip install -r requirements-voice.txt
+sounddevice>=0.5.0             # 麦克风录音（依赖本机 PortAudio，Windows/macOS 通常自带）
+numpy>=1.26.0                  # 音频缓冲
+faster-whisper>=1.0.3          # 本地语音转文字（首次运行会下载模型，约 75MB~1.5GB）
+pyttsx3>=2.90                  # 离线文字转语音（Windows 走 SAPI5，无需联网）
